@@ -4,175 +4,121 @@
 #include <sys/wait.h>
 #include <sys/sendfile.h>
 #include <cerrno>
+#include <cstring>
+#include <stdexcept>
+#include <string>
 
 const int BUFFER_SIZE = 4096;
-// user read, write
-// group read
-// others read
 const mode_t FILE_MODE = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
 
-void handleChildProcess(int pipefd[2]);
-void handleParentProcess(int pipefd[2], const char* filename);
+class FileTransfer {
+public:
+    static void transferFile(const std::string& sourceFilename, const std::string& destFilename) {
+        int pipefd[2];
+        createPipe(pipefd);
+
+        pid_t pid = fork();
+        if (pid == -1) {
+            throw std::runtime_error("Failed to fork: " + getErrorString());
+        }
+
+        if (pid == 0) {
+            handleChildProcess(pipefd, destFilename);
+        } else {
+            handleParentProcess(pipefd, sourceFilename);
+            waitForChildProcess(pid);
+        }
+    }
+
+private:
+    static void createPipe(int pipefd[2]) {
+        if (pipe(pipefd) == -1) {
+            throw std::runtime_error("Failed to create pipe: " + getErrorString());
+        }
+    }
+
+    static void handleChildProcess(int pipefd[2], const std::string& destFilename) {
+        close(pipefd[1]);  // Close unused write end
+
+        int destFile = openFile(destFilename, O_WRONLY | O_CREAT | O_TRUNC);
+        receiveFile(pipefd[0], destFile);
+
+        close(destFile);
+        close(pipefd[0]);
+        exit(0);
+    }
+
+    static void handleParentProcess(int pipefd[2], const std::string& sourceFilename) {
+        close(pipefd[0]);  // Close unused read end
+
+        int sourceFile = openFile(sourceFilename, O_RDONLY);
+        sendFile(sourceFile, pipefd[1]);
+
+        close(sourceFile);
+        close(pipefd[1]);
+    }
+
+    static int openFile(const std::string& filename, int flags) {
+        int file = open(filename.c_str(), flags, FILE_MODE);
+        if (file == -1) {
+            throw std::runtime_error("Failed to open file " + filename + ": " + getErrorString());
+        }
+        return file;
+    }
+
+    static void receiveFile(int sourcefd, int destfd) {
+        char buffer[BUFFER_SIZE];
+        ssize_t bytesRead;
+        while ((bytesRead = read(sourcefd, buffer, BUFFER_SIZE)) > 0) {
+            if (write(destfd, buffer, bytesRead) == -1) {
+                throw std::runtime_error("Failed to write to destination file: " + getErrorString());
+            }
+        }
+
+        if (bytesRead == -1) {
+            throw std::runtime_error("Failed to read from pipe: " + getErrorString());
+        }
+    }
+
+    static void sendFile(int sourcefd, int destfd) {
+        off_t offset = 0;
+        ssize_t bytesSent;
+        while ((bytesSent = sendfile(destfd, sourcefd, &offset, BUFFER_SIZE)) > 0) {
+            // sendfile successful, continue
+        }
+
+        if (bytesSent == -1) {
+            throw std::runtime_error("Failed to send file: " + getErrorString());
+        }
+    }
+
+    static void waitForChildProcess(pid_t pid) {
+        int status;
+        if (waitpid(pid, &status, 0) == -1) {
+            throw std::runtime_error("Failed to wait for child process: " + getErrorString());
+        }
+        if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+            std::cerr << "Child process exited with non-zero status: " << WEXITSTATUS(status) << std::endl;
+        }
+    }
+
+    static std::string getErrorString() {
+        return std::string(strerror(errno));
+    }
+};
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
-        std::cerr << "Usage: ./pipefile <file>\n";
+        std::cerr << "Usage: " << argv[0] << " <file>\n";
         return 1;
     }
 
-    int pipefd[2];
-    if (pipe(pipefd) == -1) {
-        perror("pipe");
+    try {
+        FileTransfer::transferFile(argv[1], "filerecv");
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
         return 1;
-    }
-
-    pid_t pid = fork();
-    if (pid == -1) {
-        perror("fork");
-        return 1;
-    }
-
-    if (pid == 0) {
-        handleChildProcess(pipefd);
-    }
-    else {
-        handleParentProcess(pipefd, argv[1]);
-        wait(nullptr);
     }
 
     return 0;
-}
-
-void handleChildProcess(int pipefd[2]) {
-    close(pipefd[1]);
-
-    int file = open("filerecv", O_WRONLY | O_CREAT | O_TRUNC, FILE_MODE);
-    if (file == -1) {
-        perror("open");
-        exit(1);
-    }
-
-    char buffer[BUFFER_SIZE];
-    ssize_t bytesRead;
-    while ((bytesRead = read(pipefd[0], buffer, BUFFER_SIZE)) > 0) {
-        if (write(file, buffer, bytesRead) == -1) {
-            perror("write");
-            exit(1);
-        }
-    }
-
-    close(file);
-    close(pipefd[0]);
-    exit(0);
-}
-
-void handleParentProcess(int pipefd[2], const char* filename) {
-    close(pipefd[0]);
-
-    int file = open(filename, O_RDONLY);
-    if (file == -1) {
-        perror("open");
-        exit(1);
-    }
-
-    off_t offset = 0;
-    ssize_t bytesSent;
-    while ((bytesSent = sendfile(pipefd[1], file, &offset, BUFFER_SIZE)) > 0) {
-        if (bytesSent == -1) {
-            perror("sendfile");
-            break;
-        }
-    }
-
-    close(file);
-    close(pipefd[1]);
-}
-#include <iostream>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/wait.h>
-#include <sys/sendfile.h>
-#include <cerrno>
-
-const int BUFFER_SIZE = 4096;
-// user read, write
-// group read
-// others read
-const mode_t FILE_MODE = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
-
-void handleChildProcess(int pipefd[2]);
-void handleParentProcess(int pipefd[2], const char* filename);
-
-int main(int argc, char* argv[]) {
-    if (argc != 2) {
-        std::cerr << "Usage: ./pipefile <file>\n";
-        return 1;
-    }
-
-    int pipefd[2];
-    if (pipe(pipefd) == -1) {
-        perror("pipe");
-        return 1;
-    }
-
-    pid_t pid = fork();
-    if (pid == -1) {
-        perror("fork");
-        return 1;
-    }
-
-    if (pid == 0) {
-        handleChildProcess(pipefd);
-    }
-    else {
-        handleParentProcess(pipefd, argv[1]);
-        wait(nullptr);
-    }
-
-    return 0;
-}
-
-void handleChildProcess(int pipefd[2]) {
-    close(pipefd[1]);
-
-    int file = open("filerecv", O_WRONLY | O_CREAT | O_TRUNC, FILE_MODE);
-    if (file == -1) {
-        perror("open");
-        exit(1);
-    }
-
-    char buffer[BUFFER_SIZE];
-    ssize_t bytesRead;
-    while ((bytesRead = read(pipefd[0], buffer, BUFFER_SIZE)) > 0) {
-        if (write(file, buffer, bytesRead) == -1) {
-            perror("write");
-            exit(1);
-        }
-    }
-
-    close(file);
-    close(pipefd[0]);
-    exit(0);
-}
-
-void handleParentProcess(int pipefd[2], const char* filename) {
-    close(pipefd[0]);
-
-    int file = open(filename, O_RDONLY);
-    if (file == -1) {
-        perror("open");
-        exit(1);
-    }
-
-    off_t offset = 0;
-    ssize_t bytesSent;
-    while ((bytesSent = sendfile(pipefd[1], file, &offset, BUFFER_SIZE)) > 0) {
-        if (bytesSent == -1) {
-            perror("sendfile");
-            break;
-        }
-    }
-
-    close(file);
-    close(pipefd[1]);
 }
